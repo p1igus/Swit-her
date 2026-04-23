@@ -173,7 +173,14 @@ def load_trigger_key():
 def event_callback(proxy, event_type, event, refcon):
     global _last_trigger, _opt_was_pressed, _ctrl_was_pressed
     
-    if event_type == Quartz.kCGEventFlagsChanged:
+    if event_type == Quartz.kCGEventKeyDown:
+        # Если нажата любая клавиша пока зажат модификатор - сбрасываем флаг
+        if _opt_was_pressed:
+            _opt_was_pressed = False
+        if _ctrl_was_pressed:
+            _ctrl_was_pressed = False
+    
+    elif event_type == Quartz.kCGEventFlagsChanged:
         flags = Quartz.CGEventGetFlags(event)
         is_opt_pressed = bool(flags & Quartz.kCGEventFlagMaskAlternate)
         is_ctrl_pressed = bool(flags & Quartz.kCGEventFlagMaskControl)
@@ -213,7 +220,8 @@ def event_callback(proxy, event_type, event, refcon):
 
 def start_tap():
     global _tap_ok
-    mask = Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
+    mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) | 
+            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown))
     tap = Quartz.CGEventTapCreate(
         Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
         0, mask, event_callback, None)
