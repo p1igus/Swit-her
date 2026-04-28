@@ -8,7 +8,7 @@ setup.py для сборки Layout Switcher как .app через py2app.
 
 from setuptools import setup
 
-APP = ['layout_switcher.py']
+APP = ['swit-her.py']
 
 OPTIONS = {
     'argv_emulation': False,

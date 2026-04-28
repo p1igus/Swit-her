@@ -108,6 +108,6 @@ def _setup_openssl():
 _setup_openssl()
 
 
-DEFAULT_SCRIPT='layout_switcher.py'
+DEFAULT_SCRIPT='swit-her.py'
 SCRIPT_MAP={}
 _run()

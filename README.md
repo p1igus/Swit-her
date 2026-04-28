@@ -2,7 +2,10 @@
 
 # Swit-her для macOS
 
-Простой аналог Punto Switcher с иконкой в меню-баре. Нажми **Option (Alt)** или **Ctrl** — и последнее слово (или выделенный текст) переключится между русской и английской раскладками.
+Простой аналог Punto Switcher без автопереключения. Нажми **Option (Alt)** или **Ctrl** — и последнее слово (или выделенный текст) переключится между русской и английской раскладками.
+
+Ваши данные никуда не улетают и программа не заставляет скачивать ненужный браузер.
+
 
 ---
 
@@ -10,22 +13,28 @@
 
 ### 1. Распакуй файлы
 
-Положи папку `layout_switcher/` куда удобно, например:
+Положи папку `swit-her/` куда удобно, например:
 ```
-~/layout_switcher/
+~/swit-her/
 ```
 
 ### 2. Установи зависимости
 
+Установи зависимости:
 ```bash
-cd ~/layout_switcher
+cd ~/swit-her
 chmod +x install.sh
 ./install.sh
 ```
 
-Или вручную:
+Собери приложение:
 ```bash
-pip3 install rumps pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz
+./build.sh
+```
+
+После сборки скопируй в папку Applications:
+```bash
+cp -r dist/Swit-her.app /Applications/
 ```
 
 ### 3. Выдай разрешение Accessibility (обязательно!)
@@ -40,10 +49,10 @@ pip3 install rumps pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz
 ### 4. Запуск
 
 ```bash
-python3 ~/layout_switcher/layout_switcher.py
+python3 ~/swit-her/swit-her.py
 ```
 
-Или собери .app через `build.sh` и запускай как обычное приложение.
+Или через папку Приложение, там уже должно лежать приложение Swit-her.
 
 ---
 
@@ -63,19 +72,21 @@ python3 ~/layout_switcher/layout_switcher.py
 
 ## Автозапуск при входе в систему
 
-1. Открой файл `com.user.layout-switcher.plist`
+1. Открой файл `com.user.swit-her.plist`
 2. Замени `ТВОЙ_ЮЗЕР` на своё имя пользователя (узнать: `whoami` в терминале)
 3. Скопируй в LaunchAgents:
 
 ```bash
-cp com.user.layout-switcher.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.user.layout-switcher.plist
+cp com.user.swit-her.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.user.swit-her.plist
 ```
 
 Для отключения автозапуска:
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.user.layout-switcher.plist
+launchctl unload ~/Library/LaunchAgents/com.user.swit-her.plist
 ```
+
+ЛИБО: Настройки → Основные → Объекты входа → Добавить приложение
 
 ---
 

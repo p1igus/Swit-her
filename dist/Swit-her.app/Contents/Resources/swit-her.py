@@ -238,7 +238,7 @@ def start_tap():
 
 class LayoutSwitcherApp(rumps.App):
     def __init__(self):
-        super().__init__('↑', quit_button='Выйти')
+        super().__init__('⊷', quit_button='Выйти')
         load_trigger_key()
         self.key_alt = rumps.MenuItem('Alt (Option)', callback=self.set_alt)
         self.key_ctrl = rumps.MenuItem('Ctrl', callback=self.set_ctrl)

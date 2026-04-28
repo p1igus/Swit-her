@@ -34,4 +34,4 @@ echo ""
 echo "🚀 Запускаем..."
 echo ""
 
-$PYTHON "$(dirname "$0")/layout_switcher.py"
+$PYTHON "$(dirname "$0")/swit-her.py"
