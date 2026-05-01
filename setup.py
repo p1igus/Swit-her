@@ -2,7 +2,6 @@
 setup.py для сборки Layout Switcher как .app через py2app.
 
 Запуск:
-    pip install py2app rumps pyobjc
     python setup.py py2app
 """
 
@@ -17,7 +16,7 @@ OPTIONS = {
         'CFBundleName': 'Swit-her',
         'CFBundleDisplayName': 'Swit-her',
         'CFBundleIdentifier': 'com.user.swither',
-        'CFBundleVersion': '1.0.0',
+        'CFBundleVersion': '1.0.1',
         'CFBundleShortVersionString': '1.0',
         'LSUIElement': True,
         'NSAppleEventsUsageDescription': 'Swit-her нужен доступ для переключения раскладки.',
