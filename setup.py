@@ -29,6 +29,7 @@ OPTIONS = {
     ],
     'frameworks': [],
     'excludes': ['tkinter', 'test', 'unittest'],
+    'strip': False,
 }
 
 setup(
