@@ -129,7 +129,7 @@ create_pkg() {
     pkgbuild --root "$pkg_root" \
         --scripts "$pkg_scripts" \
         --identifier "com.user.swither" \
-        --version "1.0.1" \
+        --version "1.0.2" \
         --install-location "/" \
         "$pkg_component" > /dev/null 2>&1
 

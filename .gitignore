@@ -48,3 +48,9 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# Graphify
+graphify-out/
+
+# Agents config
+.agents/
