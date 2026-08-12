@@ -16,6 +16,8 @@ _MARKER = '\x03LS\x03'
 # Таймауты (в секундах)
 DEBOUNCE_TIMEOUT = 0.3
 KEY_DELAY = 0.02
+SELECTION_KEY_DELAY = 0.002
+CLIPBOARD_TIMEOUT = 0.12
 PASTE_DELAY = 0.08
 SWITCH_DELAY = 0.15
 
@@ -68,17 +70,37 @@ def set_clipboard(text):
     pb.clearContents()
     pb.setString_forType_(text, NSStringPboardType)
 
-def send_key(keycode, flags=0):
+def send_key(keycode, flags=0, delay=KEY_DELAY):
     """Отправляет нажатие и отпускание клавиши"""
     e_down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
     if flags:
         Quartz.CGEventSetFlags(e_down, flags)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_down)
-    time.sleep(KEY_DELAY)
+    time.sleep(delay)
     
     e_up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_up)
-    time.sleep(KEY_DELAY + 0.01)
+    time.sleep(delay)
+
+def select_token_left():
+    """Выделяет непробельный фрагмент непосредственно слева от курсора."""
+    selected = ''
+    while True:
+        send_key(123, SHIFT, SELECTION_KEY_DELAY)
+        set_clipboard(_MARKER)
+        send_key(8, CMD, SELECTION_KEY_DELAY)
+        deadline = time.monotonic() + CLIPBOARD_TIMEOUT
+        candidate = _MARKER
+        while candidate == _MARKER and time.monotonic() < deadline:
+            time.sleep(SELECTION_KEY_DELAY)
+            candidate = get_clipboard()
+
+        if candidate == _MARKER or candidate == selected:
+            return selected
+        if candidate[:1].isspace():
+            send_key(124, SHIFT, SELECTION_KEY_DELAY)
+            return candidate[1:]
+        selected = candidate
 
 def get_current_input_source():
     try:
@@ -162,12 +184,7 @@ def switch_layout():
     
     selected = get_clipboard()
     if not (selected and selected != _MARKER and selected.strip()):
-        # Попробуем выделить слово слева
-        send_key(123, OPT|SHIFT)
-        time.sleep(0.1)
-        send_key(8, CMD)
-        time.sleep(0.12)
-        selected = get_clipboard()
+        selected = select_token_left()
     
     if not selected or selected == _MARKER or not selected.strip():
         set_clipboard(original)
@@ -324,6 +341,7 @@ class LayoutSwitcherApp(rumps.App):
         threading.Thread(target=switch_layout, daemon=True).start()
 
 if __name__ == '__main__':
+    assert [convert_text(text) for text in (',tksq', 'rjhj,rf', 'dm_image')] == ['белый', 'коробка', 'вь_шьфпу']
     threading.Thread(target=start_tap, daemon=True).start()
     time.sleep(0.5)
     LayoutSwitcherApp().run()
