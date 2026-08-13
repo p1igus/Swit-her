@@ -18,6 +18,7 @@ DEBOUNCE_TIMEOUT = 0.3
 KEY_DELAY = 0.02
 SELECTION_KEY_DELAY = 0.002
 CLIPBOARD_TIMEOUT = 0.12
+SELECTION_COPY_ATTEMPTS = 3
 PASTE_DELAY = 0.08
 SWITCH_DELAY = 0.15
 
@@ -82,20 +83,31 @@ def send_key(keycode, flags=0, delay=KEY_DELAY):
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_up)
     time.sleep(delay)
 
+def copy_selected_text(attempts=1):
+    """Копирует выделение, повторяя попытку при задержке приложения."""
+    for _ in range(attempts):
+        set_clipboard(_MARKER)
+        send_key(8, CMD, SELECTION_KEY_DELAY)
+        deadline = time.monotonic() + CLIPBOARD_TIMEOUT
+        while time.monotonic() < deadline:
+            candidate = get_clipboard()
+            if candidate != _MARKER:
+                return candidate
+            time.sleep(SELECTION_KEY_DELAY)
+    return None
+
 def select_token_left():
     """Выделяет непробельный фрагмент непосредственно слева от курсора."""
     selected = ''
     while True:
         send_key(123, SHIFT, SELECTION_KEY_DELAY)
-        set_clipboard(_MARKER)
-        send_key(8, CMD, SELECTION_KEY_DELAY)
-        deadline = time.monotonic() + CLIPBOARD_TIMEOUT
-        candidate = _MARKER
-        while candidate == _MARKER and time.monotonic() < deadline:
-            time.sleep(SELECTION_KEY_DELAY)
-            candidate = get_clipboard()
+        candidate = copy_selected_text(SELECTION_COPY_ATTEMPTS)
 
-        if candidate == _MARKER or candidate == selected:
+        if candidate is None:
+            # Не оставляем временно выделенную букву и не конвертируем часть слова.
+            send_key(124, delay=SELECTION_KEY_DELAY)
+            return ''
+        if candidate == selected:
             return selected
         if candidate[:1].isspace():
             send_key(124, SHIFT, SELECTION_KEY_DELAY)
@@ -178,15 +190,11 @@ def force_tsm_sync():
 def switch_layout():
     """Основная функция переключения раскладки и конвертации текста"""
     original = get_clipboard()
-    set_clipboard(_MARKER)
-    send_key(8, CMD)
-    time.sleep(0.12)
-    
-    selected = get_clipboard()
-    if not (selected and selected != _MARKER and selected.strip()):
+    selected = copy_selected_text()
+    if not (selected and selected.strip()):
         selected = select_token_left()
     
-    if not selected or selected == _MARKER or not selected.strip():
+    if not selected or not selected.strip():
         set_clipboard(original)
         switch_input_source()
         return
