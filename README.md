@@ -153,5 +153,5 @@ xattr -rd com.apple.quarantine /Applications/Swit-her.app
 ## Благодарности
 
 Спасибо [Polza.ai](https://polza.ai/?referral=7JCOejzeO6). У них модели дешевле чем на Openrouter. 
-Это приложение было сделано с помощью Claude Sonnet через OpenCode.
+Приложение Swit-her было сделано с помощью Claude Sonnet через OpenCode.
 

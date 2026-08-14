@@ -16,11 +16,13 @@ _MARKER = '\x03LS\x03'
 # Таймауты (в секундах)
 DEBOUNCE_TIMEOUT = 0.3
 KEY_DELAY = 0.02
-SELECTION_KEY_DELAY = 0.002
+SELECTION_KEY_DELAY = 0.012
+SELECTION_STEP_PAUSE = 0.008
 CLIPBOARD_TIMEOUT = 0.12
 SELECTION_COPY_ATTEMPTS = 3
 PASTE_DELAY = 0.08
 SWITCH_DELAY = 0.15
+MAX_TOKEN_LENGTH = 128
 
 # Таблицы конвертации раскладок
 RU_EN = {
@@ -64,55 +66,112 @@ def convert_text(text):
 
 def get_clipboard():
     pb = NSPasteboard.generalPasteboard()
+    try:
+        from AppKit import NSPasteboardTypeString
+        content = pb.stringForType_(NSPasteboardTypeString)
+        if content is not None:
+            return content
+    except Exception:
+        pass
     return pb.stringForType_(NSStringPboardType) or ''
 
 def set_clipboard(text):
     pb = NSPasteboard.generalPasteboard()
     pb.clearContents()
-    pb.setString_forType_(text, NSStringPboardType)
+    try:
+        from AppKit import NSPasteboardTypeString
+        pb.setString_forType_(text, NSPasteboardTypeString)
+    except Exception:
+        pb.setString_forType_(text, NSStringPboardType)
+
+_EVENT_SOURCE = None
+try:
+    _EVENT_SOURCE = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+except Exception:
+    pass
 
 def send_key(keycode, flags=0, delay=KEY_DELAY):
     """Отправляет нажатие и отпускание клавиши"""
-    e_down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
+    e_down = Quartz.CGEventCreateKeyboardEvent(_EVENT_SOURCE, keycode, True)
     if flags:
         Quartz.CGEventSetFlags(e_down, flags)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_down)
     time.sleep(delay)
     
-    e_up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
+    e_up = Quartz.CGEventCreateKeyboardEvent(_EVENT_SOURCE, keycode, False)
+    if flags:
+        Quartz.CGEventSetFlags(e_up, flags)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_up)
     time.sleep(delay)
 
 def copy_selected_text(attempts=1):
-    """Копирует выделение, повторяя попытку при задержке приложения."""
+    """Копирует выделение, повторяя попытку при задержке приложения.
+    Возвращает строку (может быть пустой если выделения нет) или None при таймауте.
+    Пустая строка от Electron/web-приложений НЕ считается ошибкой — они могут вернуть ''
+    когда выделение ещё не обработано. Ждём до таймаута.
+    """
     for _ in range(attempts):
         set_clipboard(_MARKER)
-        send_key(8, CMD, SELECTION_KEY_DELAY)
+        send_key(8, CMD, delay=SELECTION_KEY_DELAY)
         deadline = time.monotonic() + CLIPBOARD_TIMEOUT
         while time.monotonic() < deadline:
             candidate = get_clipboard()
-            if candidate != _MARKER:
+            # Принимаем только непустой результат, отличный от маркера
+            if candidate and candidate != _MARKER:
                 return candidate
-            time.sleep(SELECTION_KEY_DELAY)
+            time.sleep(0.005)
     return None
 
 def select_token_left():
-    """Выделяет непробельный фрагмент непосредственно слева от курсора."""
+    """Выделяет непробельный фрагмент непосредственно слева от курсора посимвольно."""
     selected = ''
-    while True:
-        send_key(123, SHIFT, SELECTION_KEY_DELAY)
+    while len(selected) < MAX_TOKEN_LENGTH:
+        send_key(123, SHIFT, delay=SELECTION_KEY_DELAY)
+        time.sleep(SELECTION_STEP_PAUSE)
         candidate = copy_selected_text(SELECTION_COPY_ATTEMPTS)
 
         if candidate is None:
             # Не оставляем временно выделенную букву и не конвертируем часть слова.
-            send_key(124, delay=SELECTION_KEY_DELAY)
+            send_key(124, delay=KEY_DELAY)
             return ''
         if candidate == selected:
+            # Выделение не изменилось — достигли начала текста
             return selected
         if candidate[:1].isspace():
-            send_key(124, SHIFT, SELECTION_KEY_DELAY)
+            # Захватили пробел — откатываем на один символ
+            send_key(124, SHIFT, delay=SELECTION_KEY_DELAY)
             return candidate[1:]
         selected = candidate
+    return selected
+
+def select_word_left():
+    """Надежно выделяет слово или токен непосредственно слева от курсора."""
+    # 1. Быстрое атомарное выделение целого слова через Option + Shift + Left
+    send_key(123, OPT | SHIFT, delay=SELECTION_KEY_DELAY)
+    time.sleep(0.01)
+    word = copy_selected_text(attempts=2)
+    
+    if word and word.strip():
+        # Если слово выделено, проверяем, нет ли слева символов пунктуации раскладки (например, б = ,)
+        selected = word
+        punct_keys = set(",.;'[]/\\`~@#$%^&*")
+        while len(selected) < MAX_TOKEN_LENGTH:
+            send_key(123, SHIFT, delay=SELECTION_KEY_DELAY)
+            time.sleep(0.005)
+            candidate = copy_selected_text(attempts=1)
+            if not candidate or candidate == selected:
+                break
+            if candidate[:1].isspace():
+                send_key(124, SHIFT, delay=SELECTION_KEY_DELAY)
+                return candidate[1:]
+            if candidate[0] not in punct_keys and not candidate[0].isalnum():
+                send_key(124, SHIFT, delay=SELECTION_KEY_DELAY)
+                return candidate[1:]
+            selected = candidate
+        return selected
+
+    # 2. Если Option + Shift + Left не сработал, используем посимвольный захват
+    return select_token_left()
 
 def get_current_input_source():
     try:
@@ -191,8 +250,8 @@ def switch_layout():
     """Основная функция переключения раскладки и конвертации текста"""
     original = get_clipboard()
     selected = copy_selected_text()
-    if not (selected and selected.strip()):
-        selected = select_token_left()
+    if not selected or not selected.strip():
+        selected = select_word_left()
     
     if not selected or not selected.strip():
         set_clipboard(original)

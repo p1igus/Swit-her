@@ -65,17 +65,61 @@ def test_delayed_copy_is_retried(app):
 
 def test_failed_copy_clears_temporary_selection(app):
     keys = []
+    delays = []
     app.time = FakeTime()
     app.set_clipboard = lambda _: None
     app.get_clipboard = lambda: app._MARKER
-    app.send_key = lambda keycode, flags=0, delay=0: keys.append((keycode, flags))
+
+    def mock_send_key(keycode, flags=0, delay=0):
+        keys.append((keycode, flags))
+        delays.append(delay)
+
+    app.send_key = mock_send_key
 
     assert app.select_token_left() == ''
     assert keys[-1] == (124, 0)
+    assert delays[-1] == app.KEY_DELAY
+
+
+def test_punctuation_conversion(app):
+    test_cases = [
+        (',tksq', 'белый'),
+        ('rjhj,rf', 'коробка'),
+        ('dm_image', 'вь_шьфпу'),
+        ('ghbdtn', 'привет'),
+        ('ghbdtn,', 'приветб'),
+        ('руддщ', 'hello'),
+    ]
+    for source, expected in test_cases:
+        assert app.convert_text(source) == expected, f"Failed converting '{source}' to '{expected}'"
+
+
+def test_max_token_length_safety(app):
+    keys = []
+    app.time = FakeTime()
+    # Simulate an infinite stream of characters without spaces
+    app.set_clipboard = lambda _: None
+    char_count = 0
+
+    def mock_send_key(keycode, flags=0, delay=0):
+        nonlocal char_count
+        keys.append((keycode, flags))
+        if keycode == 123:
+            char_count += 1
+
+    app.send_key = mock_send_key
+    app.get_clipboard = lambda: 'a' * char_count
+
+    result = app.select_token_left()
+    assert len(result) == app.MAX_TOKEN_LENGTH
+    assert keys.count((123, app.SHIFT)) == app.MAX_TOKEN_LENGTH
 
 
 if __name__ == '__main__':
     app = load_app()
     test_delayed_copy_is_retried(app)
     test_failed_copy_clears_temporary_selection(app)
-    print('ok')
+    test_punctuation_conversion(app)
+    test_max_token_length_safety(app)
+    print('All tests passed successfully!')
+
