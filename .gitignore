@@ -9,6 +9,7 @@ venv/
 env/
 .venv/
 .venv-build/
+.venv-build-intel/
 
 # Build artifacts
 build/
