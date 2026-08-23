@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-import sys, os, threading, time, traceback, ctypes, ctypes.util
+"""
+Swit-her — переключатель раскладки и конвертер текста для macOS.
+
+ВАЖНО для macOS 10.15 Catalina:
+  CGEventCreateKeyboardEvent внутри вызывает SkyLight → key_translate_initialize(),
+  который содержит dispatch_assert_queue(com.apple.main-thread).
+  Поэтому ВСЕ вызовы CGEventCreateKeyboardEvent / CGEventPost ДОЛЖНЫ выполняться
+  ТОЛЬКО на главном потоке (main dispatch queue). Мы достигаем этого через
+  performSelectorOnMainThread из PyObjC.
+"""
+import sys, os, threading, time, traceback, ctypes
 import rumps, Quartz, objc
 from AppKit import NSPasteboard, NSStringPboardType, NSUserDefaults
+from Foundation import NSObject
 
-# Логирование ошибок для диагностики
+# ═══════════════════════════════════════════════════════════════════════
+# Логирование
+# ═══════════════════════════════════════════════════════════════════════
 LOG_PATH = os.path.expanduser('~/Library/Logs/Swit-her.log')
 
 def log_error(msg, exc=None):
@@ -23,41 +36,19 @@ def global_excepthook(exctype, value, tb):
 
 sys.excepthook = global_excepthook
 if hasattr(threading, 'excepthook'):
-    threading.excepthook = lambda args: log_error(f"Thread exception in {args.thread.name}: {args.exc_value}", args.exc_value)
+    threading.excepthook = lambda args: log_error(
+        f"Thread exception in {args.thread.name}: {args.exc_value}", args.exc_value)
 
-# ── CoreGraphics через ctypes (обходит SkyLight key_translate_initialize) ──
-_cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+# ═══════════════════════════════════════════════════════════════════════
+# Константы
+# ═══════════════════════════════════════════════════════════════════════
+CMD   = Quartz.kCGEventFlagMaskCommand
+OPT   = Quartz.kCGEventFlagMaskAlternate
+SHIFT = Quartz.kCGEventFlagMaskShift
+CTRL  = Quartz.kCGEventFlagMaskControl
 
-# CGEventRef CGEventCreateKeyboardEvent(CGEventSourceRef source, CGKeyCode virtualKey, bool keyDown)
-_cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
-_cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
-
-# void CGEventSetFlags(CGEventRef event, CGEventFlags flags)
-_cg.CGEventSetFlags.restype = None
-_cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-
-# void CGEventPost(CGEventTapLocation tap, CGEventRef event)
-_cg.CGEventPost.restype = None
-_cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-
-# void CFRelease(CFTypeRef cf)
-_cf = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
-_cf.CFRelease.restype = None
-_cf.CFRelease.argtypes = [ctypes.c_void_p]
-
-# CGEventTapLocation constants
-_kCGSessionEventTap = 1  # kCGSessionEventTap
-
-# Константы для клавиш
-CMD   = 0x100000   # kCGEventFlagMaskCommand
-OPT   = 0x80000    # kCGEventFlagMaskAlternate
-SHIFT = 0x20000    # kCGEventFlagMaskShift
-CTRL  = 0x40000    # kCGEventFlagMaskControl
-
-# Маркер для буфера обмена
 _MARKER = '\x03LS\x03'
 
-# Таймауты (в секундах)
 DEBOUNCE_TIMEOUT = 0.3
 KEY_DELAY = 0.02
 SELECTION_KEY_DELAY = 0.012
@@ -68,7 +59,9 @@ PASTE_DELAY = 0.08
 SWITCH_DELAY = 0.15
 MAX_TOKEN_LENGTH = 128
 
-# Таблицы конвертации раскладок
+# ═══════════════════════════════════════════════════════════════════════
+# Таблицы раскладок
+# ═══════════════════════════════════════════════════════════════════════
 RU_EN = {
     'й':'q','ц':'w','у':'e','к':'r','е':'t','н':'y','г':'u','ш':'i','щ':'o','з':'p','х':'[','ъ':']',
     'ф':'a','ы':'s','в':'d','а':'f','п':'g','р':'h','о':'j','л':'k','д':'l','ж':';','э':"'",
@@ -80,11 +73,7 @@ RU_EN = {
 }
 EN_RU = {v:k for k,v in RU_EN.items()}
 EN_RU.update({
-    '@':'"',  # Shift+2: @ → "
-    '$':'%',  # Shift+4: $ → %
-    '%':':',  # Shift+5: % → :
-    '&':'.',  # Shift+7: & → .
-    '*':';',  # Shift+8: * → ;
+    '@':'"', '$':'%', '%':':', '&':'.', '*':';',
 })
 
 def detect_layout(text):
@@ -104,6 +93,9 @@ def convert_text(text):
     if not table: return text
     return ''.join(table.get(ch, ch) for ch in text)
 
+# ═══════════════════════════════════════════════════════════════════════
+# Буфер обмена
+# ═══════════════════════════════════════════════════════════════════════
 def get_clipboard():
     with objc.autorelease_pool():
         pb = NSPasteboard.generalPasteboard()
@@ -126,29 +118,34 @@ def set_clipboard(text):
         except Exception:
             pb.setString_forType_(text, NSStringPboardType)
 
+# ═══════════════════════════════════════════════════════════════════════
+# Отправка клавиш — ТОЛЬКО через главный поток!
+#
+# На macOS 10.15 CGEventCreateKeyboardEvent внутри SkyLight содержит
+# dispatch_assert_queue(com.apple.main-thread). Вызов из фонового потока
+# мгновенно убивает процесс через SIGILL.
+#
+# Все функции ниже (send_key, force_tsm_sync) ДОЛЖНЫ вызываться
+# исключительно из кода, работающего на главном потоке (через _MainThreadExecutor).
+# ═══════════════════════════════════════════════════════════════════════
 def send_key(keycode, flags=0, delay=KEY_DELAY):
-    """Отправляет нажатие и отпускание клавиши через ctypes CoreGraphics (thread-safe)"""
+    """Отправляет нажатие и отпускание клавиши. ВЫЗЫВАТЬ ТОЛЬКО С ГЛАВНОГО ПОТОКА."""
     try:
-        e_down = _cg.CGEventCreateKeyboardEvent(None, keycode, True)
-        if e_down:
-            if flags:
-                _cg.CGEventSetFlags(e_down, flags)
-            _cg.CGEventPost(_kCGSessionEventTap, e_down)
-            _cf.CFRelease(e_down)
+        e_down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
+        if flags:
+            Quartz.CGEventSetFlags(e_down, flags)
+        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_down)
         time.sleep(delay)
-        
-        e_up = _cg.CGEventCreateKeyboardEvent(None, keycode, False)
-        if e_up:
-            if flags:
-                _cg.CGEventSetFlags(e_up, flags)
-            _cg.CGEventPost(_kCGSessionEventTap, e_up)
-            _cf.CFRelease(e_up)
+
+        e_up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
+        if flags:
+            Quartz.CGEventSetFlags(e_up, flags)
+        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_up)
         time.sleep(delay)
     except Exception as e:
         log_error(f"Error in send_key({keycode}): {e}", e)
 
 def copy_selected_text(attempts=1):
-    """Копирует выделение, повторяя попытку при задержке приложения."""
     for _ in range(attempts):
         set_clipboard(_MARKER)
         send_key(8, CMD, delay=SELECTION_KEY_DELAY)
@@ -161,13 +158,11 @@ def copy_selected_text(attempts=1):
     return None
 
 def select_token_left():
-    """Выделяет непробельный фрагмент непосредственно слева от курсора посимвольно."""
     selected = ''
     while len(selected) < MAX_TOKEN_LENGTH:
         send_key(123, SHIFT, delay=SELECTION_KEY_DELAY)
         time.sleep(SELECTION_STEP_PAUSE)
         candidate = copy_selected_text(SELECTION_COPY_ATTEMPTS)
-
         if candidate is None:
             send_key(124, delay=KEY_DELAY)
             return ''
@@ -180,14 +175,11 @@ def select_token_left():
     return selected
 
 def select_word_left():
-    """Надежно выделяет слово или токен непосредственно слева от курсора."""
-    # 1. Быстрое атомарное выделение целого слова через Option + Shift + Left
     send_key(123, OPT | SHIFT, delay=SELECTION_KEY_DELAY)
     time.sleep(0.01)
     word = copy_selected_text(attempts=2)
-    
+
     if word and word.strip():
-        # Если слово выделено, проверяем, нет ли слева символов пунктуации раскладки
         selected = word
         punct_keys = set(",.;'[]/\\`~@#$%^&*")
         while len(selected) < MAX_TOKEN_LENGTH:
@@ -205,9 +197,11 @@ def select_word_left():
             selected = candidate
         return selected
 
-    # 2. Если Option + Shift + Left не сработал, используем посимвольный захват
     return select_token_left()
 
+# ═══════════════════════════════════════════════════════════════════════
+# Carbon TIS — переключение раскладки (thread-safe через ctypes)
+# ═══════════════════════════════════════════════════════════════════════
 _carbon = None
 _kTISPropertyInputSourceID = None
 
@@ -226,7 +220,7 @@ def _init_carbon():
             _carbon.TISSelectInputSource.argtypes = [ctypes.c_void_p]
             _kTISPropertyInputSourceID = ctypes.c_void_p.in_dll(_carbon, 'kTISPropertyInputSourceID')
         except Exception as e:
-            log_error(f"Error loading Carbon framework: {e}", e)
+            log_error(f"Error loading Carbon: {e}", e)
             _carbon = False
 
 def get_current_input_source():
@@ -239,13 +233,8 @@ def get_current_input_source():
                 if prop:
                     return str(objc.objc_object(c_void_p=prop))
         except Exception as e:
-            log_error(f"Error getting current input source: {e}", e)
+            log_error(f"Error getting input source: {e}", e)
     return None
-
-def switch_to_next_input_source():
-    """Переключает на следующий источник ввода"""
-    send_key(49, CMD)
-    time.sleep(SWITCH_DELAY)
 
 def get_input_source_language(source_id=None):
     if source_id is None:
@@ -258,7 +247,6 @@ def get_input_source_language(source_id=None):
     return None
 
 def switch_to_target_language(target_lang):
-    """Переключает раскладку на целевой язык через Carbon TIS API"""
     _init_carbon()
     if _carbon:
         try:
@@ -277,55 +265,53 @@ def switch_to_target_language(target_lang):
                             _carbon.TISSelectInputSource(s_ptr)
                             return
         except Exception as e:
-            log_error(f"Error switching input source via Carbon: {e}", e)
-    # Запасной вариант переключения через горячую клавишу
+            log_error(f"Error switching via Carbon: {e}", e)
     send_key(49, CMD)
     time.sleep(SWITCH_DELAY)
 
 def switch_input_source():
-    """Переключает на следующий источник ввода"""
-    switch_to_next_input_source()
+    send_key(49, CMD)
+    time.sleep(SWITCH_DELAY)
 
 def force_tsm_sync():
-    """Форсирует TSM перечитать текущий источник ввода через Shift-tap"""
     try:
-        e_down = _cg.CGEventCreateKeyboardEvent(None, 56, True)
-        if e_down:
-            _cg.CGEventSetFlags(e_down, SHIFT)
-            _cg.CGEventPost(_kCGSessionEventTap, e_down)
-            _cf.CFRelease(e_down)
+        e_down = Quartz.CGEventCreateKeyboardEvent(None, 56, True)
+        Quartz.CGEventSetFlags(e_down, SHIFT)
+        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_down)
         time.sleep(KEY_DELAY)
-        
-        e_up = _cg.CGEventCreateKeyboardEvent(None, 56, False)
-        if e_up:
-            _cg.CGEventSetFlags(e_up, 0)
-            _cg.CGEventPost(_kCGSessionEventTap, e_up)
-            _cf.CFRelease(e_up)
+        e_up = Quartz.CGEventCreateKeyboardEvent(None, 56, False)
+        Quartz.CGEventSetFlags(e_up, 0)
+        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_up)
         time.sleep(0.05)
     except Exception as e:
         log_error(f"Error in force_tsm_sync: {e}", e)
 
+# ═══════════════════════════════════════════════════════════════════════
+# Основная логика переключения
+# ═══════════════════════════════════════════════════════════════════════
 def _do_switch_layout():
+    """Выполняет конвертацию текста и переключение раскладки.
+    ВЫЗЫВАТЬ ТОЛЬКО С ГЛАВНОГО ПОТОКА (содержит CGEventCreateKeyboardEvent)."""
     original = get_clipboard()
     selected = copy_selected_text()
     if not selected or not selected.strip():
         selected = select_word_left()
-    
+
     if not selected or not selected.strip():
         set_clipboard(original)
         switch_input_source()
         return
-    
+
     layout = detect_layout(selected)
     converted = convert_text(selected)
-    
+
     if converted == selected:
         set_clipboard(original)
         switch_input_source()
         return
-    
+
     target_lang = 'en' if layout == 'ru' else 'ru'
-    
+
     set_clipboard(converted)
     time.sleep(0.05)
     send_key(9, CMD)
@@ -336,14 +322,38 @@ def _do_switch_layout():
     time.sleep(PASTE_DELAY)
     force_tsm_sync()
 
-def switch_layout():
-    """Основная функция переключения раскладки и конвертации текста с защитой от сбоев"""
-    try:
-        with objc.autorelease_pool():
-            _do_switch_layout()
-    except Exception as e:
-        log_error(f"Error in switch_layout: {e}", e)
+# ═══════════════════════════════════════════════════════════════════════
+# Диспетчеризация на главный поток
+#
+# NSObject.performSelectorOnMainThread гарантирует выполнение на
+# com.apple.main-thread GCD очереди, что удовлетворяет
+# dispatch_assert_queue внутри SkyLight на macOS 10.15.
+# ═══════════════════════════════════════════════════════════════════════
+class _MainThreadExecutor(NSObject):
+    """ObjC-объект для диспетчеризации switch_layout на главный поток."""
 
+    def performSwitch_(self, sender):
+        try:
+            with objc.autorelease_pool():
+                _do_switch_layout()
+        except Exception as e:
+            log_error(f"Error in performSwitch on main thread: {e}", e)
+
+_executor = None
+
+def switch_layout():
+    """Переключает раскладку, гарантируя выполнение на главном потоке."""
+    global _executor
+    if _executor is None:
+        _executor = _MainThreadExecutor.alloc().init()
+    # waitUntilDone=True: фоновый поток ждёт завершения работы на главном потоке.
+    # Это безопасно — фоновый поток не держит никаких блокировок.
+    _executor.performSelectorOnMainThread_withObject_waitUntilDone_(
+        'performSwitch:', None, True)
+
+# ═══════════════════════════════════════════════════════════════════════
+# Event Tap — перехват клавиш
+# ═══════════════════════════════════════════════════════════════════════
 _last_trigger = 0.0
 _tap_ok = False
 _opt_was_pressed = False
@@ -371,86 +381,92 @@ def load_trigger_key():
         log_error(f"Error loading trigger key: {e}", e)
 
 def handle_modifier_release(is_pressed, was_pressed, has_other_mods):
-    """Обрабатывает отпускание модификатора и запускает переключение"""
     if was_pressed and not is_pressed and not has_other_mods:
         global _last_trigger
         now = time.time()
         if now - _last_trigger > DEBOUNCE_TIMEOUT:
             _last_trigger = now
+            # Запускаем в фоновом потоке, который затем диспетчеризует
+            # работу на главный поток через performSelectorOnMainThread
             threading.Thread(target=switch_layout, daemon=True).start()
         return False
     return was_pressed
 
 def event_callback(proxy, event_type, event, refcon):
-    """Обработчик событий клавиатуры"""
     global _opt_was_pressed, _ctrl_was_pressed
-    
-    # Защита от автоотключения Event Tap операционной системой
-    if event_type == Quartz.kCGEventTapDisabledByTimeout or event_type == Quartz.kCGEventTapDisabledByUserInput:
+
+    if event_type == Quartz.kCGEventTapDisabledByTimeout or \
+       event_type == Quartz.kCGEventTapDisabledByUserInput:
         if proxy is not None:
             Quartz.CGEventTapEnable(proxy, True)
         return event
-    
+
     try:
         if event_type == Quartz.kCGEventKeyDown:
             _opt_was_pressed = False
             _ctrl_was_pressed = False
-        
+
         elif event_type == Quartz.kCGEventFlagsChanged:
             flags = Quartz.CGEventGetFlags(event)
-            is_opt_pressed = bool(flags & OPT)
-            is_ctrl_pressed = bool(flags & CTRL)
-            has_cmd = bool(flags & CMD)
+            is_opt  = bool(flags & OPT)
+            is_ctrl = bool(flags & CTRL)
+            has_cmd   = bool(flags & CMD)
             has_shift = bool(flags & SHIFT)
-            
+
             if _trigger_key == 'alt':
-                has_other_mods = has_cmd or is_ctrl_pressed or has_shift
-                if is_opt_pressed and not has_other_mods:
+                other = has_cmd or is_ctrl or has_shift
+                if is_opt and not other:
                     _opt_was_pressed = True
-                elif is_opt_pressed and has_other_mods:
+                elif is_opt and other:
                     _opt_was_pressed = False
-                elif not is_opt_pressed:
-                    _opt_was_pressed = handle_modifier_release(is_opt_pressed, _opt_was_pressed, has_other_mods)
+                elif not is_opt:
+                    _opt_was_pressed = handle_modifier_release(
+                        is_opt, _opt_was_pressed, other)
             else:
-                has_other_mods = has_cmd or is_opt_pressed or has_shift
-                if is_ctrl_pressed and not has_other_mods:
+                other = has_cmd or is_opt or has_shift
+                if is_ctrl and not other:
                     _ctrl_was_pressed = True
-                elif is_ctrl_pressed and has_other_mods:
+                elif is_ctrl and other:
                     _ctrl_was_pressed = False
-                elif not is_ctrl_pressed:
-                    _ctrl_was_pressed = handle_modifier_release(is_ctrl_pressed, _ctrl_was_pressed, has_other_mods)
+                elif not is_ctrl:
+                    _ctrl_was_pressed = handle_modifier_release(
+                        is_ctrl, _ctrl_was_pressed, other)
     except Exception as e:
         log_error(f"Error in event_callback: {e}", e)
-    
+
     return event
 
 def start_tap():
     global _tap_ok
     try:
-        mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) | 
+        mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) |
                 Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown))
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
             0, mask, event_callback, None)
         if not tap:
             print("❌ Event Tap не создан — нет разрешения Accessibility")
-            log_error("Event Tap could not be created - missing Accessibility permissions")
+            log_error("Event Tap: no Accessibility permission")
             _tap_ok = False
             return
         _tap_ok = True
         print("✅ Event Tap создан")
         src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopDefaultMode)
+        Quartz.CFRunLoopAddSource(
+            Quartz.CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopDefaultMode)
         Quartz.CGEventTapEnable(tap, True)
         Quartz.CFRunLoopRun()
     except Exception as e:
         log_error(f"Fatal error in start_tap: {e}", e)
 
+# ═══════════════════════════════════════════════════════════════════════
+# Приложение (rumps menubar)
+# ═══════════════════════════════════════════════════════════════════════
 class LayoutSwitcherApp(rumps.App):
     def __init__(self):
         super().__init__('⊷', quit_button='Выйти')
         load_trigger_key()
-        self.key_alt = rumps.MenuItem('Alt (Option)', callback=self.set_alt)
+        self.key_alt  = rumps.MenuItem('Alt (Option)', callback=self.set_alt)
         self.key_ctrl = rumps.MenuItem('Ctrl', callback=self.set_ctrl)
         self.update_checkmarks()
         self.menu = [
@@ -464,7 +480,7 @@ class LayoutSwitcherApp(rumps.App):
         self._timer.start()
 
     def update_checkmarks(self):
-        self.key_alt.state = 1 if _trigger_key == 'alt' else 0
+        self.key_alt.state  = 1 if _trigger_key == 'alt'  else 0
         self.key_ctrl.state = 1 if _trigger_key == 'ctrl' else 0
 
     def set_alt(self, _):
@@ -491,8 +507,10 @@ class LayoutSwitcherApp(rumps.App):
     def do_switch(self, _):
         threading.Thread(target=switch_layout, daemon=True).start()
 
+# ═══════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    assert [convert_text(text) for text in (',tksq', 'rjhj,rf', 'dm_image')] == ['белый', 'коробка', 'вь_шьфпу']
+    assert [convert_text(t) for t in (',tksq', 'rjhj,rf', 'dm_image')] == \
+           ['белый', 'коробка', 'вь_шьфпу']
     threading.Thread(target=start_tap, daemon=True).start()
     time.sleep(0.5)
     LayoutSwitcherApp().run()
