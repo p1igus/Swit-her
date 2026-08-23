@@ -461,7 +461,26 @@ class LayoutSwitcherApp(rumps.App):
     def do_switch(self, _):
         threading.Thread(target=switch_layout, daemon=True).start()
 
+def init_main_thread():
+    """Прогревает подсистемы macOS (SkyLight, HIToolbox, TIS, Carbon) на главном потоке.
+    Это критически необходимо для macOS 10.15 Catalina, где первая инициализация таблицы
+    трансляции клавиш требует com.apple.main-thread (иначе libdispatch assertion crash).
+    """
+    try:
+        # Прогрев SkyLight key_translate_initialize на главном потоке
+        dummy_down = Quartz.CGEventCreateKeyboardEvent(None, 56, True)
+        dummy_up = Quartz.CGEventCreateKeyboardEvent(None, 56, False)
+        del dummy_down, dummy_up
+        
+        # Прогрев буфера обмена и Carbon TIS на главном потоке
+        get_clipboard()
+        _init_carbon()
+        get_current_input_source()
+    except Exception as e:
+        log_error(f"Error during main thread warmup: {e}", e)
+
 if __name__ == '__main__':
+    init_main_thread()
     assert [convert_text(text) for text in (',tksq', 'rjhj,rf', 'dm_image')] == ['белый', 'коробка', 'вь_шьфпу']
     threading.Thread(target=start_tap, daemon=True).start()
     time.sleep(0.5)
