@@ -173,38 +173,45 @@ def select_word_left():
     # 2. Если Option + Shift + Left не сработал, используем посимвольный захват
     return select_token_left()
 
+_carbon = None
+_kTISPropertyInputSourceID = None
+
+def _init_carbon():
+    global _carbon, _kTISPropertyInputSourceID
+    if _carbon is None:
+        try:
+            import ctypes
+            _carbon = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/Carbon.framework/Carbon')
+            _carbon.TISCopyCurrentKeyboardInputSource.restype = ctypes.c_void_p
+            _carbon.TISCopyCurrentKeyboardInputSource.argtypes = []
+            _carbon.TISGetInputSourceProperty.restype = ctypes.c_void_p
+            _carbon.TISGetInputSourceProperty.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            _carbon.TISCreateInputSourceList.restype = ctypes.c_void_p
+            _carbon.TISCreateInputSourceList.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+            _carbon.TISSelectInputSource.restype = ctypes.c_int32
+            _carbon.TISSelectInputSource.argtypes = [ctypes.c_void_p]
+            _kTISPropertyInputSourceID = ctypes.c_void_p.in_dll(_carbon, 'kTISPropertyInputSourceID')
+        except Exception:
+            _carbon = False
+
 def get_current_input_source():
-    try:
-        from AppKit import NSTextInputContext
-        context = NSTextInputContext.currentInputContext()
-        if context:
-            source_id = context.selectedKeyboardInputSource()
-            if source_id:
-                return str(source_id)
-    except:
-        pass
-    
-    try:
-        from CoreFoundation import TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty, kTISPropertyInputSourceID
-        source = TISCopyCurrentKeyboardInputSource()
-        if source:
-            source_id = TISGetInputSourceProperty(source, kTISPropertyInputSourceID)
-            if source_id:
-                return str(source_id)
-    except:
-        pass
-    
+    _init_carbon()
+    if _carbon:
+        try:
+            import objc
+            source = _carbon.TISCopyCurrentKeyboardInputSource()
+            if source:
+                prop = _carbon.TISGetInputSourceProperty(source, _kTISPropertyInputSourceID.value)
+                if prop:
+                    return str(objc.objc_object(c_void_p=prop))
+        except Exception:
+            pass
     return None
 
 def switch_to_next_input_source():
     """Переключает на следующий источник ввода"""
-    try:
-        from CoreFoundation import TISSelectNextInputSource
-        TISSelectNextInputSource()
-        time.sleep(0.1)
-    except:
-        send_key(49, CMD)
-        time.sleep(SWITCH_DELAY)
+    send_key(49, CMD)
+    time.sleep(SWITCH_DELAY)
 
 def get_input_source_language(source_id=None):
     if source_id is None:
@@ -216,19 +223,31 @@ def get_input_source_language(source_id=None):
         return 'en'
     return None
 
-def switch_to_target_language(target_lang, max_attempts=5):
-    """Переключает раскладку на целевой язык"""
-    try:
-        from CoreFoundation import TISSelectNextInputSource
-        for _ in range(max_attempts):
-            current_lang = get_input_source_language()
-            if current_lang == target_lang:
-                return
-            TISSelectNextInputSource()
-            time.sleep(SWITCH_DELAY)
-    except Exception:
-        send_key(49, CMD)
-        time.sleep(SWITCH_DELAY)
+def switch_to_target_language(target_lang):
+    """Переключает раскладку на целевой язык через Carbon TIS API"""
+    _init_carbon()
+    if _carbon:
+        try:
+            import objc
+            source_list_ref = _carbon.TISCreateInputSourceList(None, False)
+            if source_list_ref:
+                source_list = objc.objc_object(c_void_p=source_list_ref)
+                for s in source_list:
+                    s_ptr = objc.pyobjc_id(s)
+                    prop = _carbon.TISGetInputSourceProperty(s_ptr, _kTISPropertyInputSourceID.value)
+                    if prop:
+                        sid = str(objc.objc_object(c_void_p=prop)).lower()
+                        if target_lang == 'ru' and ('russian' in sid or '.ru' in sid):
+                            _carbon.TISSelectInputSource(s_ptr)
+                            return
+                        elif target_lang == 'en' and any(x in sid for x in ['abc', 'us', 'british', 'australian', 'english', 'ukelele']):
+                            _carbon.TISSelectInputSource(s_ptr)
+                            return
+        except Exception:
+            pass
+    # Запасной вариант переключения
+    send_key(49, CMD)
+    time.sleep(SWITCH_DELAY)
 
 def switch_input_source():
     """Переключает на следующий источник ввода"""
@@ -246,8 +265,7 @@ def force_tsm_sync():
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_up)
     time.sleep(0.05)
 
-def switch_layout():
-    """Основная функция переключения раскладки и конвертации текста"""
+def _do_switch_layout():
     original = get_clipboard()
     selected = copy_selected_text()
     if not selected or not selected.strip():
@@ -277,6 +295,13 @@ def switch_layout():
     switch_to_target_language(target_lang)
     time.sleep(PASTE_DELAY)
     force_tsm_sync()
+
+def switch_layout():
+    """Основная функция переключения раскладки и конвертации текста с защитой от сбоев"""
+    try:
+        _do_switch_layout()
+    except Exception as e:
+        print(f"Error in switch_layout: {e}", file=sys.stderr)
 
 _last_trigger = 0.0
 _tap_ok = False
@@ -313,34 +338,43 @@ def event_callback(proxy, event_type, event, refcon):
     """Обработчик событий клавиатуры"""
     global _opt_was_pressed, _ctrl_was_pressed
     
-    if event_type == Quartz.kCGEventKeyDown:
-        # Если нажата любая клавиша пока зажат модификатор - сбрасываем флаг
-        _opt_was_pressed = False
-        _ctrl_was_pressed = False
+    # Защита от автоотключения Event Tap операционной системой
+    if event_type == Quartz.kCGEventTapDisabledByTimeout or event_type == Quartz.kCGEventTapDisabledByUserInput:
+        if proxy is not None:
+            Quartz.CGEventTapEnable(proxy, True)
+        return event
     
-    elif event_type == Quartz.kCGEventFlagsChanged:
-        flags = Quartz.CGEventGetFlags(event)
-        is_opt_pressed = bool(flags & OPT)
-        is_ctrl_pressed = bool(flags & CTRL)
-        has_cmd = bool(flags & CMD)
-        has_shift = bool(flags & SHIFT)
+    try:
+        if event_type == Quartz.kCGEventKeyDown:
+            # Если нажата любая клавиша пока зажат модификатор - сбрасываем флаг
+            _opt_was_pressed = False
+            _ctrl_was_pressed = False
         
-        if _trigger_key == 'alt':
-            has_other_mods = has_cmd or is_ctrl_pressed or has_shift
-            if is_opt_pressed and not has_other_mods:
-                _opt_was_pressed = True
-            elif is_opt_pressed and has_other_mods:
-                _opt_was_pressed = False
-            elif not is_opt_pressed:
-                _opt_was_pressed = handle_modifier_release(is_opt_pressed, _opt_was_pressed, has_other_mods)
-        else:
-            has_other_mods = has_cmd or is_opt_pressed or has_shift
-            if is_ctrl_pressed and not has_other_mods:
-                _ctrl_was_pressed = True
-            elif is_ctrl_pressed and has_other_mods:
-                _ctrl_was_pressed = False
-            elif not is_ctrl_pressed:
-                _ctrl_was_pressed = handle_modifier_release(is_ctrl_pressed, _ctrl_was_pressed, has_other_mods)
+        elif event_type == Quartz.kCGEventFlagsChanged:
+            flags = Quartz.CGEventGetFlags(event)
+            is_opt_pressed = bool(flags & OPT)
+            is_ctrl_pressed = bool(flags & CTRL)
+            has_cmd = bool(flags & CMD)
+            has_shift = bool(flags & SHIFT)
+            
+            if _trigger_key == 'alt':
+                has_other_mods = has_cmd or is_ctrl_pressed or has_shift
+                if is_opt_pressed and not has_other_mods:
+                    _opt_was_pressed = True
+                elif is_opt_pressed and has_other_mods:
+                    _opt_was_pressed = False
+                elif not is_opt_pressed:
+                    _opt_was_pressed = handle_modifier_release(is_opt_pressed, _opt_was_pressed, has_other_mods)
+            else:
+                has_other_mods = has_cmd or is_opt_pressed or has_shift
+                if is_ctrl_pressed and not has_other_mods:
+                    _ctrl_was_pressed = True
+                elif is_ctrl_pressed and has_other_mods:
+                    _ctrl_was_pressed = False
+                elif not is_ctrl_pressed:
+                    _ctrl_was_pressed = handle_modifier_release(is_ctrl_pressed, _ctrl_was_pressed, has_other_mods)
+    except Exception as e:
+        print(f"Error in event_callback: {e}", file=sys.stderr)
     
     return event
 
