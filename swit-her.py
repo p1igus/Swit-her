@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, threading, time, traceback
+import sys, os, threading, time, traceback, ctypes, ctypes.util
 import rumps, Quartz, objc
 from AppKit import NSPasteboard, NSStringPboardType, NSUserDefaults
 
@@ -25,11 +25,34 @@ sys.excepthook = global_excepthook
 if hasattr(threading, 'excepthook'):
     threading.excepthook = lambda args: log_error(f"Thread exception in {args.thread.name}: {args.exc_value}", args.exc_value)
 
+# ── CoreGraphics через ctypes (обходит SkyLight key_translate_initialize) ──
+_cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+
+# CGEventRef CGEventCreateKeyboardEvent(CGEventSourceRef source, CGKeyCode virtualKey, bool keyDown)
+_cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+_cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
+
+# void CGEventSetFlags(CGEventRef event, CGEventFlags flags)
+_cg.CGEventSetFlags.restype = None
+_cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+
+# void CGEventPost(CGEventTapLocation tap, CGEventRef event)
+_cg.CGEventPost.restype = None
+_cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+
+# void CFRelease(CFTypeRef cf)
+_cf = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+_cf.CFRelease.restype = None
+_cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+# CGEventTapLocation constants
+_kCGSessionEventTap = 1  # kCGSessionEventTap
+
 # Константы для клавиш
-CMD = Quartz.kCGEventFlagMaskCommand
-OPT = Quartz.kCGEventFlagMaskAlternate
-SHIFT = Quartz.kCGEventFlagMaskShift
-CTRL = Quartz.kCGEventFlagMaskControl
+CMD   = 0x100000   # kCGEventFlagMaskCommand
+OPT   = 0x80000    # kCGEventFlagMaskAlternate
+SHIFT = 0x20000    # kCGEventFlagMaskShift
+CTRL  = 0x40000    # kCGEventFlagMaskControl
 
 # Маркер для буфера обмена
 _MARKER = '\x03LS\x03'
@@ -104,18 +127,22 @@ def set_clipboard(text):
             pb.setString_forType_(text, NSStringPboardType)
 
 def send_key(keycode, flags=0, delay=KEY_DELAY):
-    """Отправляет нажатие и отпускание клавиши в сессионный поток событий"""
+    """Отправляет нажатие и отпускание клавиши через ctypes CoreGraphics (thread-safe)"""
     try:
-        e_down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
-        if flags:
-            Quartz.CGEventSetFlags(e_down, flags)
-        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_down)
+        e_down = _cg.CGEventCreateKeyboardEvent(None, keycode, True)
+        if e_down:
+            if flags:
+                _cg.CGEventSetFlags(e_down, flags)
+            _cg.CGEventPost(_kCGSessionEventTap, e_down)
+            _cf.CFRelease(e_down)
         time.sleep(delay)
         
-        e_up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
-        if flags:
-            Quartz.CGEventSetFlags(e_up, flags)
-        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_up)
+        e_up = _cg.CGEventCreateKeyboardEvent(None, keycode, False)
+        if e_up:
+            if flags:
+                _cg.CGEventSetFlags(e_up, flags)
+            _cg.CGEventPost(_kCGSessionEventTap, e_up)
+            _cf.CFRelease(e_up)
         time.sleep(delay)
     except Exception as e:
         log_error(f"Error in send_key({keycode}): {e}", e)
@@ -188,7 +215,6 @@ def _init_carbon():
     global _carbon, _kTISPropertyInputSourceID
     if _carbon is None:
         try:
-            import ctypes
             _carbon = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/Carbon.framework/Carbon')
             _carbon.TISCopyCurrentKeyboardInputSource.restype = ctypes.c_void_p
             _carbon.TISCopyCurrentKeyboardInputSource.argtypes = []
@@ -263,14 +289,18 @@ def switch_input_source():
 def force_tsm_sync():
     """Форсирует TSM перечитать текущий источник ввода через Shift-tap"""
     try:
-        e_down = Quartz.CGEventCreateKeyboardEvent(None, 56, True)
-        Quartz.CGEventSetFlags(e_down, SHIFT)
-        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_down)
+        e_down = _cg.CGEventCreateKeyboardEvent(None, 56, True)
+        if e_down:
+            _cg.CGEventSetFlags(e_down, SHIFT)
+            _cg.CGEventPost(_kCGSessionEventTap, e_down)
+            _cf.CFRelease(e_down)
         time.sleep(KEY_DELAY)
         
-        e_up = Quartz.CGEventCreateKeyboardEvent(None, 56, False)
-        Quartz.CGEventSetFlags(e_up, 0)
-        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_up)
+        e_up = _cg.CGEventCreateKeyboardEvent(None, 56, False)
+        if e_up:
+            _cg.CGEventSetFlags(e_up, 0)
+            _cg.CGEventPost(_kCGSessionEventTap, e_up)
+            _cf.CFRelease(e_up)
         time.sleep(0.05)
     except Exception as e:
         log_error(f"Error in force_tsm_sync: {e}", e)
@@ -461,26 +491,7 @@ class LayoutSwitcherApp(rumps.App):
     def do_switch(self, _):
         threading.Thread(target=switch_layout, daemon=True).start()
 
-def init_main_thread():
-    """Прогревает подсистемы macOS (SkyLight, HIToolbox, TIS, Carbon) на главном потоке.
-    Это критически необходимо для macOS 10.15 Catalina, где первая инициализация таблицы
-    трансляции клавиш требует com.apple.main-thread (иначе libdispatch assertion crash).
-    """
-    try:
-        # Прогрев SkyLight key_translate_initialize на главном потоке
-        dummy_down = Quartz.CGEventCreateKeyboardEvent(None, 56, True)
-        dummy_up = Quartz.CGEventCreateKeyboardEvent(None, 56, False)
-        del dummy_down, dummy_up
-        
-        # Прогрев буфера обмена и Carbon TIS на главном потоке
-        get_clipboard()
-        _init_carbon()
-        get_current_input_source()
-    except Exception as e:
-        log_error(f"Error during main thread warmup: {e}", e)
-
 if __name__ == '__main__':
-    init_main_thread()
     assert [convert_text(text) for text in (',tksq', 'rjhj,rf', 'dm_image')] == ['белый', 'коробка', 'вь_шьфпу']
     threading.Thread(target=start_tap, daemon=True).start()
     time.sleep(0.5)
