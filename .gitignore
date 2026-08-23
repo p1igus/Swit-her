@@ -10,6 +10,7 @@ env/
 .venv/
 .venv-build/
 .venv-build-intel/
+.cache-intel-python/
 
 # Build artifacts
 build/
