@@ -27,7 +27,8 @@ pip install --quiet rumps pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Qu
 
 echo ""
 echo "🔨 Собираем .app..."
-rm -rf dist
+mkdir -p dist
+rm -rf "dist/${APP_NAME}" "dist/${DMG_NAME}.dmg" "dist/${DMG_NAME}.pkg"
 python setup.py py2app 2>&1
 
 deactivate
