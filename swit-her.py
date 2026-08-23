@@ -1,8 +1,29 @@
 #!/usr/bin/env python3
-import sys, threading, time
-import rumps, Quartz
+import sys, os, threading, time, traceback
+import rumps, Quartz, objc
 from AppKit import NSPasteboard, NSStringPboardType, NSUserDefaults
-from Quartz import CoreGraphics as CG
+
+# Логирование ошибок для диагностики
+LOG_PATH = os.path.expanduser('~/Library/Logs/Swit-her.log')
+
+def log_error(msg, exc=None):
+    try:
+        with open(LOG_PATH, 'a', encoding='utf-8') as f:
+            t = time.strftime('%Y-%m-%d %H:%M:%S')
+            f.write(f"[{t}] {msg}\n")
+            if exc:
+                f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+def global_excepthook(exctype, value, tb):
+    log_error(f"Uncaught exception: {value}", value)
+    sys.__excepthook__(exctype, value, tb)
+
+sys.excepthook = global_excepthook
+if hasattr(threading, 'excepthook'):
+    threading.excepthook = lambda args: log_error(f"Thread exception in {args.thread.name}: {args.exc_value}", args.exc_value)
 
 # Константы для клавиш
 CMD = Quartz.kCGEventFlagMaskCommand
@@ -35,9 +56,6 @@ RU_EN = {
     'ё':'\\','Ё':'|','№':'#',
 }
 EN_RU = {v:k for k,v in RU_EN.items()}
-# Shift+цифры: эти символы нельзя добавить в RU_EN — они конфликтуют
-# с буквенными маппингами (ж→;, Ж→:, Э→", ю→.) и станут ambiguous.
-# Добавляем только в EN→RU направление.
 EN_RU.update({
     '@':'"',  # Shift+2: @ → "
     '$':'%',  # Shift+4: $ → %
@@ -47,7 +65,6 @@ EN_RU.update({
 })
 
 def detect_layout(text):
-    # Символы, которые есть в обоих словарях — пропускаем, они амбигуозны
     ambiguous = set(RU_EN) & set(EN_RU)
     for ch in text:
         if ch in ambiguous:
@@ -65,58 +82,52 @@ def convert_text(text):
     return ''.join(table.get(ch, ch) for ch in text)
 
 def get_clipboard():
-    pb = NSPasteboard.generalPasteboard()
-    try:
-        from AppKit import NSPasteboardTypeString
-        content = pb.stringForType_(NSPasteboardTypeString)
-        if content is not None:
-            return content
-    except Exception:
-        pass
-    return pb.stringForType_(NSStringPboardType) or ''
+    with objc.autorelease_pool():
+        pb = NSPasteboard.generalPasteboard()
+        try:
+            from AppKit import NSPasteboardTypeString
+            content = pb.stringForType_(NSPasteboardTypeString)
+            if content is not None:
+                return content
+        except Exception:
+            pass
+        return pb.stringForType_(NSStringPboardType) or ''
 
 def set_clipboard(text):
-    pb = NSPasteboard.generalPasteboard()
-    pb.clearContents()
-    try:
-        from AppKit import NSPasteboardTypeString
-        pb.setString_forType_(text, NSPasteboardTypeString)
-    except Exception:
-        pb.setString_forType_(text, NSStringPboardType)
-
-_EVENT_SOURCE = None
-try:
-    _EVENT_SOURCE = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
-except Exception:
-    pass
+    with objc.autorelease_pool():
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        try:
+            from AppKit import NSPasteboardTypeString
+            pb.setString_forType_(text, NSPasteboardTypeString)
+        except Exception:
+            pb.setString_forType_(text, NSStringPboardType)
 
 def send_key(keycode, flags=0, delay=KEY_DELAY):
-    """Отправляет нажатие и отпускание клавиши"""
-    e_down = Quartz.CGEventCreateKeyboardEvent(_EVENT_SOURCE, keycode, True)
-    if flags:
-        Quartz.CGEventSetFlags(e_down, flags)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_down)
-    time.sleep(delay)
-    
-    e_up = Quartz.CGEventCreateKeyboardEvent(_EVENT_SOURCE, keycode, False)
-    if flags:
-        Quartz.CGEventSetFlags(e_up, flags)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_up)
-    time.sleep(delay)
+    """Отправляет нажатие и отпускание клавиши в сессионный поток событий"""
+    try:
+        e_down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
+        if flags:
+            Quartz.CGEventSetFlags(e_down, flags)
+        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_down)
+        time.sleep(delay)
+        
+        e_up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
+        if flags:
+            Quartz.CGEventSetFlags(e_up, flags)
+        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_up)
+        time.sleep(delay)
+    except Exception as e:
+        log_error(f"Error in send_key({keycode}): {e}", e)
 
 def copy_selected_text(attempts=1):
-    """Копирует выделение, повторяя попытку при задержке приложения.
-    Возвращает строку (может быть пустой если выделения нет) или None при таймауте.
-    Пустая строка от Electron/web-приложений НЕ считается ошибкой — они могут вернуть ''
-    когда выделение ещё не обработано. Ждём до таймаута.
-    """
+    """Копирует выделение, повторяя попытку при задержке приложения."""
     for _ in range(attempts):
         set_clipboard(_MARKER)
         send_key(8, CMD, delay=SELECTION_KEY_DELAY)
         deadline = time.monotonic() + CLIPBOARD_TIMEOUT
         while time.monotonic() < deadline:
             candidate = get_clipboard()
-            # Принимаем только непустой результат, отличный от маркера
             if candidate and candidate != _MARKER:
                 return candidate
             time.sleep(0.005)
@@ -131,14 +142,11 @@ def select_token_left():
         candidate = copy_selected_text(SELECTION_COPY_ATTEMPTS)
 
         if candidate is None:
-            # Не оставляем временно выделенную букву и не конвертируем часть слова.
             send_key(124, delay=KEY_DELAY)
             return ''
         if candidate == selected:
-            # Выделение не изменилось — достигли начала текста
             return selected
         if candidate[:1].isspace():
-            # Захватили пробел — откатываем на один символ
             send_key(124, SHIFT, delay=SELECTION_KEY_DELAY)
             return candidate[1:]
         selected = candidate
@@ -152,7 +160,7 @@ def select_word_left():
     word = copy_selected_text(attempts=2)
     
     if word and word.strip():
-        # Если слово выделено, проверяем, нет ли слева символов пунктуации раскладки (например, б = ,)
+        # Если слово выделено, проверяем, нет ли слева символов пунктуации раскладки
         selected = word
         punct_keys = set(",.;'[]/\\`~@#$%^&*")
         while len(selected) < MAX_TOKEN_LENGTH:
@@ -191,21 +199,21 @@ def _init_carbon():
             _carbon.TISSelectInputSource.restype = ctypes.c_int32
             _carbon.TISSelectInputSource.argtypes = [ctypes.c_void_p]
             _kTISPropertyInputSourceID = ctypes.c_void_p.in_dll(_carbon, 'kTISPropertyInputSourceID')
-        except Exception:
+        except Exception as e:
+            log_error(f"Error loading Carbon framework: {e}", e)
             _carbon = False
 
 def get_current_input_source():
     _init_carbon()
     if _carbon:
         try:
-            import objc
             source = _carbon.TISCopyCurrentKeyboardInputSource()
             if source:
                 prop = _carbon.TISGetInputSourceProperty(source, _kTISPropertyInputSourceID.value)
                 if prop:
                     return str(objc.objc_object(c_void_p=prop))
-        except Exception:
-            pass
+        except Exception as e:
+            log_error(f"Error getting current input source: {e}", e)
     return None
 
 def switch_to_next_input_source():
@@ -228,7 +236,6 @@ def switch_to_target_language(target_lang):
     _init_carbon()
     if _carbon:
         try:
-            import objc
             source_list_ref = _carbon.TISCreateInputSourceList(None, False)
             if source_list_ref:
                 source_list = objc.objc_object(c_void_p=source_list_ref)
@@ -243,9 +250,9 @@ def switch_to_target_language(target_lang):
                         elif target_lang == 'en' and any(x in sid for x in ['abc', 'us', 'british', 'australian', 'english', 'ukelele']):
                             _carbon.TISSelectInputSource(s_ptr)
                             return
-        except Exception:
-            pass
-    # Запасной вариант переключения
+        except Exception as e:
+            log_error(f"Error switching input source via Carbon: {e}", e)
+    # Запасной вариант переключения через горячую клавишу
     send_key(49, CMD)
     time.sleep(SWITCH_DELAY)
 
@@ -255,15 +262,18 @@ def switch_input_source():
 
 def force_tsm_sync():
     """Форсирует TSM перечитать текущий источник ввода через Shift-tap"""
-    e_down = Quartz.CGEventCreateKeyboardEvent(None, 56, True)
-    Quartz.CGEventSetFlags(e_down, SHIFT)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_down)
-    time.sleep(KEY_DELAY)
-    
-    e_up = Quartz.CGEventCreateKeyboardEvent(None, 56, False)
-    Quartz.CGEventSetFlags(e_up, 0)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, e_up)
-    time.sleep(0.05)
+    try:
+        e_down = Quartz.CGEventCreateKeyboardEvent(None, 56, True)
+        Quartz.CGEventSetFlags(e_down, SHIFT)
+        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_down)
+        time.sleep(KEY_DELAY)
+        
+        e_up = Quartz.CGEventCreateKeyboardEvent(None, 56, False)
+        Quartz.CGEventSetFlags(e_up, 0)
+        Quartz.CGEventPost(Quartz.kCGSessionEventTap, e_up)
+        time.sleep(0.05)
+    except Exception as e:
+        log_error(f"Error in force_tsm_sync: {e}", e)
 
 def _do_switch_layout():
     original = get_clipboard()
@@ -299,9 +309,10 @@ def _do_switch_layout():
 def switch_layout():
     """Основная функция переключения раскладки и конвертации текста с защитой от сбоев"""
     try:
-        _do_switch_layout()
+        with objc.autorelease_pool():
+            _do_switch_layout()
     except Exception as e:
-        print(f"Error in switch_layout: {e}", file=sys.stderr)
+        log_error(f"Error in switch_layout: {e}", e)
 
 _last_trigger = 0.0
 _tap_ok = False
@@ -312,16 +323,22 @@ _trigger_key = 'alt'
 def set_trigger_key(key):
     global _trigger_key
     _trigger_key = key
-    defaults = NSUserDefaults.standardUserDefaults()
-    defaults.setObject_forKey_(key, 'LayoutSwitcherTriggerKey')
-    defaults.synchronize()
+    try:
+        defaults = NSUserDefaults.standardUserDefaults()
+        defaults.setObject_forKey_(key, 'LayoutSwitcherTriggerKey')
+        defaults.synchronize()
+    except Exception as e:
+        log_error(f"Error saving trigger key: {e}", e)
 
 def load_trigger_key():
     global _trigger_key
-    defaults = NSUserDefaults.standardUserDefaults()
-    saved = defaults.stringForKey_('LayoutSwitcherTriggerKey')
-    if saved in ['alt', 'ctrl']:
-        _trigger_key = saved
+    try:
+        defaults = NSUserDefaults.standardUserDefaults()
+        saved = defaults.stringForKey_('LayoutSwitcherTriggerKey')
+        if saved in ['alt', 'ctrl']:
+            _trigger_key = saved
+    except Exception as e:
+        log_error(f"Error loading trigger key: {e}", e)
 
 def handle_modifier_release(is_pressed, was_pressed, has_other_mods):
     """Обрабатывает отпускание модификатора и запускает переключение"""
@@ -346,7 +363,6 @@ def event_callback(proxy, event_type, event, refcon):
     
     try:
         if event_type == Quartz.kCGEventKeyDown:
-            # Если нажата любая клавиша пока зажат модификатор - сбрасываем флаг
             _opt_was_pressed = False
             _ctrl_was_pressed = False
         
@@ -374,27 +390,31 @@ def event_callback(proxy, event_type, event, refcon):
                 elif not is_ctrl_pressed:
                     _ctrl_was_pressed = handle_modifier_release(is_ctrl_pressed, _ctrl_was_pressed, has_other_mods)
     except Exception as e:
-        print(f"Error in event_callback: {e}", file=sys.stderr)
+        log_error(f"Error in event_callback: {e}", e)
     
     return event
 
 def start_tap():
     global _tap_ok
-    mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) | 
-            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown))
-    tap = Quartz.CGEventTapCreate(
-        Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
-        0, mask, event_callback, None)
-    if not tap:
-        print("❌ Event Tap не создан — нет разрешения Accessibility")
-        _tap_ok = False
-        return
-    _tap_ok = True
-    print("✅ Event Tap создан")
-    src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-    Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopDefaultMode)
-    Quartz.CGEventTapEnable(tap, True)
-    Quartz.CFRunLoopRun()
+    try:
+        mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) | 
+                Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown))
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
+            0, mask, event_callback, None)
+        if not tap:
+            print("❌ Event Tap не создан — нет разрешения Accessibility")
+            log_error("Event Tap could not be created - missing Accessibility permissions")
+            _tap_ok = False
+            return
+        _tap_ok = True
+        print("✅ Event Tap создан")
+        src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopDefaultMode)
+        Quartz.CGEventTapEnable(tap, True)
+        Quartz.CFRunLoopRun()
+    except Exception as e:
+        log_error(f"Fatal error in start_tap: {e}", e)
 
 class LayoutSwitcherApp(rumps.App):
     def __init__(self):
